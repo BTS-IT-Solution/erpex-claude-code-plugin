@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "erpex-code-agent",
-      "source": ".",
+      "source": "./",
       "description": "Drive ERPEX project.task workflow from Claude Code.",
       "version": "1.0.0",
       "homepage": "https://erpex.ai",
