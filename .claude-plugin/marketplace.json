@@ -9,8 +9,9 @@
     {
       "name": "erpex-code-agent",
       "source": {
-        "source": "url",
-        "url": "https://github.com/BTS-IT-Solution/erpex-claude-code-plugin.git"
+        "source": "git-subdir",
+        "url": "https://github.com/BTS-IT-Solution/erpex-claude-code-plugin.git",
+        "path": "."
       },
       "description": "Drive ERPEX project.task workflow from Claude Code.",
       "version": "1.0.0",
