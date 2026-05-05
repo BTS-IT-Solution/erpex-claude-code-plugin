@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python ${CLAUDE_PLUGIN_ROOT}/scripts/erpex_client.py on-exit-plan-mode --auto-approve",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

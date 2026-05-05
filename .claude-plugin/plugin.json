@@ -1,0 +1,8 @@
+{
+  "name": "erpex-code-agent",
+  "version": "1.0.0",
+  "description": "Drive ERPEX project.task workflow from Claude Code (CLI / VS Code).",
+  "author": { "name": "ERPEX" },
+  "homepage": "https://erpex.ai",
+  "license": "Other proprietary"
+}
