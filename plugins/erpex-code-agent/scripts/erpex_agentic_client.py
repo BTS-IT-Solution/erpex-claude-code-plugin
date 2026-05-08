@@ -518,10 +518,18 @@ def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
         payload = _hook_payload()
         prompt = (payload.get("prompt") or "").strip()
         if not prompt:
+            _hook_log("user-prompt noop reason=empty-prompt")
             return
         sid = (payload.get("session_id") or "").strip()
+        prev_tid, _ = _read_active_task()
         tid = _ensure_task(_truncate_title(prompt), sid)
-        _api_call("POST", "/chat/user", {"task_id": tid, "content": prompt})
+        resp = _api_call("POST", "/chat/user",
+                         {"task_id": tid, "content": prompt})
+        action = "reused" if prev_tid == tid else "created"
+        _hook_log(
+            f"user-prompt posted task={tid} ({action}) len={len(prompt)} "
+            f"message_id={resp.get('message_id')}"
+        )
     return _hook_safe("user-prompt", _go)
 
 
@@ -565,21 +573,29 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
         payload = _hook_payload()
         transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
         if not transcript:
+            _hook_log("stop noop reason=no-transcript-path")
             return
         text = _last_assistant_text(transcript)
         if not text:
+            _hook_log(f"stop noop reason=empty-text transcript={transcript}")
             return
         cached_tid, cached_sid = _read_active_task()
         if not cached_tid:
-            # No task pointer — user-prompt hook hasn't fired this session.
+            _hook_log("stop noop reason=no-cached-task")
             return
         sid = (payload.get("session_id") or "").strip()
         if cached_sid and sid and cached_sid != sid:
-            # Cached task belongs to a different session — don't post our
-            # reply onto someone else's task.
+            _hook_log(
+                f"stop noop reason=session-mismatch "
+                f"cached_sid={cached_sid[:8]}… payload_sid={sid[:8]}…"
+            )
             return
-        _api_call("POST", "/chat/assistant",
-                  {"task_id": cached_tid, "content": text})
+        resp = _api_call("POST", "/chat/assistant",
+                         {"task_id": cached_tid, "content": text})
+        _hook_log(
+            f"stop posted task={cached_tid} len={len(text)} "
+            f"message_id={resp.get('message_id')}"
+        )
     return _hook_safe("stop", _go)
 
 
@@ -589,6 +605,7 @@ def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
         tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
         plan_text = (tool_input.get("plan") or "").strip()
         if not plan_text:
+            _hook_log("pre-exit-plan noop reason=empty-plan")
             return
         first_line = next(
             (ln.strip() for ln in plan_text.splitlines() if ln.strip()),
@@ -597,7 +614,12 @@ def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
         title = _truncate_title(re.sub(r"^#+\s*", "", first_line))
         sid = (payload.get("session_id") or "").strip()
         tid = _ensure_task(title, sid)
-        _api_call("POST", "/plan/set", {"task_id": tid, "plan_text": plan_text})
+        resp = _api_call("POST", "/plan/set",
+                         {"task_id": tid, "plan_text": plan_text})
+        _hook_log(
+            f"pre-exit-plan posted task={tid} len={len(plan_text)} "
+            f"article_id={resp.get('article_id')}"
+        )
     return _hook_safe("pre-exit-plan", _go)
 
 
@@ -606,12 +628,21 @@ def cmd_hook_post_exit_plan(_args: argparse.Namespace) -> int:
         payload = _hook_payload()
         cached_tid, cached_sid = _read_active_task()
         if not cached_tid:
+            _hook_log("post-exit-plan noop reason=no-cached-task")
             return
         sid = (payload.get("session_id") or "").strip()
         if cached_sid and sid and cached_sid != sid:
+            _hook_log(
+                f"post-exit-plan noop reason=session-mismatch "
+                f"cached_sid={cached_sid[:8]}… payload_sid={sid[:8]}…"
+            )
             return
-        _api_call("POST", "/task/stage",
-                  {"task_id": cached_tid, "stage_key": "inprogress"})
+        resp = _api_call("POST", "/task/stage",
+                         {"task_id": cached_tid, "stage_key": "inprogress"})
+        _hook_log(
+            f"post-exit-plan posted task={cached_tid} "
+            f"stage_id={resp.get('stage_id')} stage_name={resp.get('stage_name')}"
+        )
     return _hook_safe("post-exit-plan", _go)
 
 
