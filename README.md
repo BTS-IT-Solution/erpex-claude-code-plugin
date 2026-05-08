@@ -2,34 +2,46 @@
 
 Drive ERPEX `project.task` workflow from your own Claude Code session
 (CLI or VS Code extension). Companion to the
-`erpex_addons/erpex_core_addons/erpex_code_agent` Odoo module.
+`erpex_addons/erpex_core_addons/erpex_agentic_code` Odoo module.
 
 ## What this gives you
 
-Four slash commands and one hook:
+Five slash commands and four hooks that mirror the session into ERPEX:
 
 | Command | What it does |
 |---|---|
-| `/erpex-setup [url] [api_key] [model]` | Stores ERPEX URL, API key, and rewrite-subagent model. Run once per machine. |
-| `/erpex-rewrite [task_id] [project_id]` | Spawns a Sonnet subagent that turns a rough request into a clean business requirement; pushes it to ERPEX. Creates a new task if `task_id` is missing and a `project_id` is given. |
-| `/erpex-plan [task_id]` | Reads the task's BR, generates a plan in markdown, pushes it to ERPEX as a plan_proposal. The user reviews and clicks *Approve & Implement* in the ERPEX UI. |
-| `/erpex-implement [task_id]` (alias `/erpex-approve`) | Fetches the approved plan from ERPEX and starts executing. Returns 409 if not yet approved. |
-| **PostToolUse hook on `ExitPlanMode`** | When you click *Approve* in Claude Code's plan-mode UI, the hook auto-pushes the plan to ERPEX **and** advances the task to *Implementing* (no second click needed). |
+| `/setup [url] [api_key] [model]` | Stores ERPEX URL, API key, and rewrite-subagent model. Run once per machine. |
+| `/rewrite [task_id] [project_id]` | Spawns the `erpex-rewriter` subagent and **updates the active task** (auto-created during the session, or supplied) with a polished name + business-requirement description. |
+| `/plan [task_id]` | Generates a plan as Markdown and pushes it to the task's Plan tab via `/plan/set`. |
+| `/implement [task_id]` (alias `/approve`) | Reads the task's plan via `/plan/get` and executes it in the current session. |
+
+| Hook | What it does |
+|---|---|
+| **UserPromptSubmit** | Auto-creates a project (folder name) and a task (first-prompt title) if they don't exist yet, then mirrors every prompt into `/chat/user`. |
+| **Stop** | Pulls the most recent assistant turn from the transcript and posts it to `/chat/assistant` — Claude's reply lands in the same task's chat panel. |
+| **PreToolUse → ExitPlanMode** | When Claude proposes a plan in plan-mode, the hook pushes the plan body to ERPEX **before** the user is asked to approve, so the same plan they're seeing in Claude shows up in the task's Plan tab. |
+| **PostToolUse → ExitPlanMode** | Fires only after the user approves the plan in Claude's UI — moves the task to stage **`inprogress`**. |
+
+The net effect: opening Claude Code in a fresh repo and sending a prompt is
+enough to materialize a project, a task, the chat history, and (when you
+plan-mode) the plan + stage transition in ERPEX, with no manual plumbing.
 
 ## Prerequisites
 
-1. **ERPEX module enabled.** `erpex_code_agent` ≥ 19.0.1.11.0 installed and
-   *Settings → General Settings → Code Agent → Code Agent Mode* set to
-   **Claude Code Plugin** (the default).
+1. **ERPEX module enabled.** `erpex_agentic_code` (≥ 19.0.1.0.0) installed.
+   Endpoints used: `/project/create`, `/project/get-or-create` (recommended;
+   the plugin falls back to `/project/create` if the lookup endpoint is not
+   yet deployed), `/task/create`, `/task/update`, `/task/stage`,
+   `/chat/user`, `/chat/assistant`, `/plan/set`, `/plan/get`.
 2. **API key.** Generate one in ERPEX: *Preferences → Account Security →
    New API Key* (any name; copy the key).
-3. **Claude Code** ≥ a version with plugins / `${CLAUDE_PLUGIN_ROOT}` (any
-   recent CLI or VS Code extension). Python 3.9+ on PATH.
+3. **Claude Code** with plugin support (`${CLAUDE_PLUGIN_ROOT}` available).
+   Python 3.9+ on PATH (the hooks invoke `python3`).
 
 ## Install
 
 ```bash
-# Add the marketplace (separate repo) and install the plugin.
+# Add the marketplace and install the plugin.
 /plugin marketplace add https://github.com/<your-org>/erpex-claude-code-marketplace
 /plugin install erpex-code-agent@erpex
 ```
@@ -43,78 +55,95 @@ Or, for local development, point Claude Code at this repo directly:
 Then configure it once:
 
 ```
-/erpex-setup https://erpex.example.com sk_xxxxxx sonnet
+/setup https://erpex.example.com sk_xxxxxx sonnet
 ```
 
 This writes `~/.config/erpex-code-agent/plugin.toml` (mode 0600). The `model`
 arg controls the model the `erpex-rewriter` subagent uses; pass `opus` if
 you want heavier rewriting.
 
-## Per-repo setup
+## Per-repo state
 
-Inside each repository whose `code_path` matches a project in ERPEX, the
-plugin keeps a tiny pointer file:
+The plugin keeps two pointer files in `.erpex/` for the cwd:
 
 ```
-.erpex/current_task     # plain text: task_id=123
+.erpex/current_project   # plain text: project_id=42
+.erpex/current_task      # plain text: task_id=123
 ```
 
-Add it to your global gitignore:
+The hooks read and write these files; you usually don't need to touch them.
+Both are populated lazily — the project is resolved (looked up by folder
+name, else created) when the first chat message fires, and the task is
+created from the first user prompt's text (truncated to 70 chars).
+
+Add `.erpex/` to your global gitignore:
 
 ```bash
 echo '.erpex/' >> ~/.config/git/ignore
 ```
 
-Or per-repo in `.gitignore`.
-
 ## Workflow
 
-### Starting from a free-form request
+### From a fresh repo
 
-```
+```bash
 cd <your-repo>
 claude
-> /erpex-rewrite "" 7      # task_id="" → create new in project 7
+> hello, please add a CSV export to the invoice list
 ```
 
-The subagent rewrites your request as a developer-ready BR and pushes it
-to ERPEX. The task lands in stage *Rewrite*. Open it in ERPEX, set
-*Requires Plan* if needed.
+That single prompt:
 
-### Starting from an existing task
+- Creates project `<your-repo>` in ERPEX (or reuses one with the same name).
+- Creates a task titled `hello, please add a CSV export to the invoice list`.
+- Posts your prompt to `/chat/user`.
+- Posts Claude's reply to `/chat/assistant` (when the turn ends).
 
-```
-> /erpex-rewrite 1234         # rewrite the BR for task 1234
-> /erpex-plan 1234            # generate + push a plan
-                              # → user clicks Approve in ERPEX
-> /erpex-implement 1234       # fetch approved plan, start executing
-```
+### Polishing the BR
 
-### Starting from native plan-mode (skips /erpex-plan)
-
-If you'd rather use Claude Code's built-in plan-mode:
+Once you've narrowed down what you want, run:
 
 ```
-> /erpex-rewrite 1234         # writes .erpex/current_task
-> /plan                       # native plan-mode
-                              # ... iterate ...
-                              # click Approve in plan-mode UI
-                              # → hook pushes plan + auto-advances ERPEX to Implementing
+> /rewrite
 ```
 
-The PostToolUse hook on `ExitPlanMode` reads `.erpex/current_task`,
-extracts the approved plan, and POSTs it with `auto_approve=true`.
+The rewriter subagent reads the repo for context and emits a polished
+title + BR; the helper then **updates** the existing task in place —
+new name, new description. No duplicate is created.
+
+### Planning
+
+Two paths, both supported:
+
+**Native plan-mode** (recommended — Shift+Tab to enter):
+
+```
+> [iterate on the plan]
+[click Approve in plan-mode UI]
+```
+
+- `PreToolUse` pushes the plan to the task's Plan tab.
+- After you click Approve, `PostToolUse` advances the task to *In Progress*.
+
+**Direct `/plan`** (skips Claude's plan-mode UI):
+
+```
+> /plan
+> /implement
+```
+
+`/plan` writes a Markdown plan and pushes it via `/plan/set`. `/implement`
+reads it back via `/plan/get` and starts executing.
 
 ## Troubleshooting
 
-- `not configured. Run /erpex-setup first.` → Run `/erpex-setup`.
-- `403 plugin mode disabled` → Your ERPEX admin set the mode to *daemon*.
-  Ask them to flip *Settings → General Settings → Code Agent → Code Agent
-  Mode* to *Claude Code Plugin*.
-- `409 Plan is not yet approved` → Click *Approve & Implement* on the task
-  in ERPEX (the chat banner), then re-run `/erpex-implement`.
-- Hook fires but says `non-JSON stdin, skipping` → harmless; means
-  Claude Code didn't pass a structured payload that turn.
+- `not configured. Run /setup first.` → Run `/setup`.
+- Hooks succeed but nothing shows in ERPEX → check the URL/API key in
+  `~/.config/erpex-code-agent/plugin.toml`. Hook failures are logged to
+  stderr (one-line `erpex hook: ...`) and never block the Claude turn.
+- Duplicate projects appearing for the same repo → upgrade ERPEX to a
+  build that ships `/project/get-or-create`. Until then, keep
+  `.erpex/current_project` checked in or backed up so the cache survives.
 
 ## License
 

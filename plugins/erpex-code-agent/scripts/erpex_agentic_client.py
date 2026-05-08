@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""HTTP client for the erpex_agentic_code module's `/erpex_agentic_code/api/*`
+endpoints. Stdlib-only (urllib + tomllib) so the plugin runs on a fresh
+machine without `pip install`.
+
+Config lives at `~/.config/erpex-code-agent/plugin.toml` (written by `setup`).
+
+Subcommands:
+
+    setup            --url <u> --api-key <k> [--model <m>]
+    project-create   --name "Foo"
+    task-create      --project-id 12 --name "T1" [--description ...]
+                                                 [--agentic-description ...]
+                                                 [--parent-id 9]
+    task-update      --task-id 33 --field name="New" [--field priority=1 ...]
+    task-stage       --task-id 33 --stage plan
+    chat-user        --task-id 33 --content "..." [--sender "Ahmed"]
+    chat-assistant   --task-id 33 --content "..."
+    plan-set         --task-id 33 (--plan-text "..." | --plan-file plan.md)
+    plan-get         --task-id 33
+
+Hook subcommands (read JSON payload from stdin, never block the user):
+
+    hook-user-prompt        UserPromptSubmit  → ensure task, POST /chat/user
+    hook-stop               Stop              → POST /chat/assistant from
+                                                last assistant turn in
+                                                transcript_path
+    hook-pre-exit-plan      PreToolUse        → ensure task, POST /plan/set
+                            (matcher          (no auto-approve)
+                            ExitPlanMode)
+    hook-post-exit-plan     PostToolUse       → POST /task/stage inprogress
+                            (matcher
+                            ExitPlanMode)
+
+Exit codes:
+    0  success (or hook safe-exit on failure)
+    1  client error (config / validation / unknown subcommand)
+    2  server error (4xx / 5xx) for non-hook subcommands
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None  # type: ignore
+
+
+CONFIG_DIR = Path(os.path.expanduser("~/.config/erpex-code-agent"))
+CONFIG_PATH = CONFIG_DIR / "plugin.toml"
+API_BASE = "/erpex_agentic_code/api"
+
+
+# ---------------------------------------------------------------- config
+
+def _parse_toml(text: str) -> dict:
+    if tomllib is not None:
+        return tomllib.loads(text)
+    out: dict = {}
+    section = out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^\[([^\]]+)\]$", line)
+        if m:
+            section = out.setdefault(m.group(1), {})
+            continue
+        m = re.match(r'^([A-Za-z0-9_]+)\s*=\s*"(.*)"$', line)
+        if m:
+            section[m.group(1)] = m.group(2)
+    return out
+
+
+def _load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        sys.stderr.write(
+            f"erpex-agentic-client: not configured. Run /setup first.\n"
+            f"(expected config at {CONFIG_PATH})\n"
+        )
+        sys.exit(1)
+    cfg = _parse_toml(CONFIG_PATH.read_text())
+    if not cfg.get("odoo", {}).get("url") or not cfg.get("odoo", {}).get("api_key"):
+        sys.stderr.write(
+            f"erpex-agentic-client: config at {CONFIG_PATH} is missing "
+            f"[odoo].url or [odoo].api_key.\n"
+        )
+        sys.exit(1)
+    return cfg
+
+
+def _save_config(url: str, api_key: str, model: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    body = (
+        '[odoo]\n'
+        f'url = "{url}"\n'
+        f'api_key = "{api_key}"\n'
+        '\n'
+        '[agent]\n'
+        f'model = "{model}"\n'
+    )
+    CONFIG_PATH.write_text(body)
+    try:
+        os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass  # Windows / odd FS — best-effort.
+
+
+# ---------------------------------------------------------------- HTTP
+
+class HttpError(RuntimeError):
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+        self.body = body
+
+
+def _request(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    query: dict | None = None,
+) -> dict:
+    cfg = _load_config()
+    base_url = cfg["odoo"]["url"].rstrip("/")
+    url = base_url + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    headers = {
+        "Authorization": "Bearer " + cfg["odoo"]["api_key"],
+        "Accept": "application/json",
+    }
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8") or "{}"
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8") if exc.fp else ""
+        raise HttpError(exc.code, raw) from exc
+
+
+def _api_call(method: str, endpoint: str, body: dict | None = None,
+              query: dict | None = None) -> dict:
+    return _request(method, API_BASE + endpoint, body=body, query=query)
+
+
+def _print_json(data: dict) -> None:
+    print(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------- session pointers
+
+def _repo_root() -> Path:
+    return Path.cwd()
+
+
+def _erpex_dir() -> Path:
+    return _repo_root() / ".erpex"
+
+
+def _active_task_path() -> Path:
+    return _erpex_dir() / "current_task"
+
+
+def _active_project_path() -> Path:
+    return _erpex_dir() / "current_project"
+
+
+def _read_pointer(path: Path, key: str) -> int | None:
+    if not path.exists():
+        return None
+    txt = path.read_text().strip()
+    m = re.search(rf"{key}\s*=\s*(\d+)", txt)
+    if m:
+        return int(m.group(1))
+    if txt.isdigit():
+        return int(txt)
+    return None
+
+
+def _write_pointer(path: Path, key: str, value: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{key}={value}\n")
+
+
+def _read_active_task() -> int | None:
+    return _read_pointer(_active_task_path(), "task_id")
+
+
+def _write_active_task(task_id: int) -> None:
+    _write_pointer(_active_task_path(), "task_id", task_id)
+
+
+def _read_active_project() -> int | None:
+    return _read_pointer(_active_project_path(), "project_id")
+
+
+def _write_active_project(project_id: int) -> None:
+    _write_pointer(_active_project_path(), "project_id", project_id)
+
+
+def _folder_name() -> str:
+    return _repo_root().name or "untitled-project"
+
+
+# ---------------------------------------------------------------- text helpers
+
+def _truncate_title(text: str, n: int = 70) -> str:
+    """Sanitize a free-form prompt into a one-line task title."""
+    s = re.sub(r"\s+", " ", (text or "").strip())
+    if len(s) > n:
+        s = s[: n - 1].rstrip() + "…"
+    return s or "Untitled task"
+
+
+def _split_title_body(text: str) -> tuple[str, str]:
+    """Treat the first H1 as the new title; everything else is the body."""
+    lines = text.splitlines()
+    title = ""
+    body_start = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^#\s+(.+)$", s)
+        if m:
+            title = m.group(1).strip()
+            body_start = i + 1
+        break
+    body = "\n".join(lines[body_start:]).strip()
+    return title, body or text.strip()
+
+
+# ---------------------------------------------------------------- ensure helpers
+
+def _ensure_project() -> int:
+    """Return a project_id for the current repo, creating one if needed."""
+    pid = _read_active_project()
+    if pid:
+        return pid
+    name = _folder_name()
+    try:
+        data = _api_call("POST", "/project/get-or-create", {"name": name})
+    except HttpError as exc:
+        if exc.status == 404:
+            # Endpoint not deployed yet — fall back to plain create.
+            data = _api_call("POST", "/project/create", {"name": name})
+        else:
+            raise
+    pid = int(data["project_id"])
+    _write_active_project(pid)
+    return pid
+
+
+def _ensure_task(initial_title: str) -> int:
+    """Return a task_id for the current session, creating one if needed."""
+    tid = _read_active_task()
+    if tid:
+        return tid
+    pid = _ensure_project()
+    body = {"project_id": pid, "name": initial_title or "Untitled task"}
+    data = _api_call("POST", "/task/create", body)
+    tid = int(data["task_id"])
+    _write_active_task(tid)
+    return tid
+
+
+# ---------------------------------------------------------------- args
+
+def _parse_field_kv(items: list[str]) -> dict:
+    """Parse `--field key=value` pairs. Values starting with `[` or `{` are
+    JSON-decoded so the caller can pass M2M command tuples; integers are
+    coerced; everything else stays a string.
+    """
+    out: dict = {}
+    for item in items or []:
+        if "=" not in item:
+            sys.stderr.write(f"--field requires KEY=VALUE, got: {item!r}\n")
+            sys.exit(1)
+        key, _, value = item.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if value and value[0] in "[{":
+            try:
+                out[key] = json.loads(value)
+                continue
+            except json.JSONDecodeError:
+                pass
+        if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+            out[key] = int(value)
+            continue
+        if value.lower() in ("true", "false"):
+            out[key] = value.lower() == "true"
+            continue
+        out[key] = value
+    return out
+
+
+# ---------------------------------------------------------------- subcommands (regular)
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    _save_config(args.url, args.api_key, args.model or "sonnet")
+    print(f"wrote {CONFIG_PATH}")
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if plugin_root and args.model:
+        agents_dir = Path(plugin_root) / "agents"
+        if agents_dir.exists():
+            override = agents_dir / "erpex-rewriter.local.md"
+            override.write_text(
+                "---\n"
+                "name: erpex-rewriter\n"
+                "description: Polishes a raw user request into a developer-ready business requirement.\n"
+                f"model: {args.model}\n"
+                'tools: ["Read", "Glob", "Grep"]\n'
+                "---\n"
+                "You are a senior product writer. Read the repo for context, then output\n"
+                "a single Markdown document whose first H1 is the new task title and\n"
+                "whose body is the rewritten business requirement (audience: implementing\n"
+                "dev). Do not propose code; do not enter plan mode. Output only the\n"
+                "document.\n"
+            )
+            print(f"wrote {override}")
+    return 0
+
+
+def cmd_project_create(args: argparse.Namespace) -> int:
+    data = _api_call("POST", "/project/create", {"name": args.name})
+    _print_json(data)
+    return 0
+
+
+def cmd_task_create(args: argparse.Namespace) -> int:
+    body: dict = {"project_id": int(args.project_id), "name": args.name}
+    if args.description:
+        body["description"] = args.description
+    if args.agentic_description:
+        body["agentic_description"] = args.agentic_description
+    if args.parent_id:
+        body["parent_id"] = int(args.parent_id)
+    data = _api_call("POST", "/task/create", body)
+    if "task_id" in data:
+        _write_active_task(int(data["task_id"]))
+    _print_json(data)
+    return 0
+
+
+def cmd_task_update(args: argparse.Namespace) -> int:
+    fields = _parse_field_kv(args.field)
+    if not fields:
+        sys.stderr.write("at least one --field KEY=VALUE is required\n")
+        return 1
+    body: dict = {"task_id": int(args.task_id)}
+    body.update(fields)
+    data = _api_call("POST", "/task/update", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_task_stage(args: argparse.Namespace) -> int:
+    body = {"task_id": int(args.task_id), "stage_key": args.stage}
+    data = _api_call("POST", "/task/stage", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_chat_user(args: argparse.Namespace) -> int:
+    body: dict = {"task_id": int(args.task_id), "content": args.content}
+    if args.sender:
+        body["sender_name"] = args.sender
+    data = _api_call("POST", "/chat/user", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_chat_assistant(args: argparse.Namespace) -> int:
+    body = {"task_id": int(args.task_id), "content": args.content}
+    data = _api_call("POST", "/chat/assistant", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_plan_set(args: argparse.Namespace) -> int:
+    if args.plan_file:
+        plan_text = Path(args.plan_file).read_text()
+    elif args.plan_text is not None:
+        plan_text = args.plan_text
+    else:
+        sys.stderr.write("either --plan-text or --plan-file is required\n")
+        return 1
+    body = {"task_id": int(args.task_id), "plan_text": plan_text}
+    data = _api_call("POST", "/plan/set", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_plan_get(args: argparse.Namespace) -> int:
+    data = _api_call("GET", "/plan/get", query={"task_id": int(args.task_id)})
+    _print_json(data)
+    return 0
+
+
+# ---------------------------------------------------------------- subcommands (hooks)
+
+def _hook_warn(msg: str) -> None:
+    sys.stderr.write(f"erpex hook: {msg}\n")
+
+
+def _hook_payload() -> dict:
+    raw = sys.stdin.read() or "{}"
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _hook_safe(fn) -> int:
+    """Wrapper: never raise out of a hook. Always return 0 so Claude isn't
+    blocked by ERPEX flakiness or a missing /setup."""
+    try:
+        fn()
+    except HttpError as exc:
+        _hook_warn(str(exc))
+    except SystemExit:
+        # _load_config calls sys.exit(1) when not configured — silently no-op.
+        pass
+    except Exception as exc:  # pylint: disable=broad-except
+        _hook_warn(f"unexpected: {exc}")
+    return 0
+
+
+def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
+    def _go() -> None:
+        payload = _hook_payload()
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            return
+        tid = _ensure_task(_truncate_title(prompt))
+        _api_call("POST", "/chat/user", {"task_id": tid, "content": prompt})
+    return _hook_safe(_go)
+
+
+def _last_assistant_text(transcript_path: str) -> str:
+    """Read the JSONL transcript and return the most recent assistant turn's
+    concatenated text content. Skips tool_use / tool_result blocks."""
+    p = Path(transcript_path)
+    if not p.exists():
+        return ""
+    last_text = ""
+    for line in p.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = entry.get("message") or entry
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text") or "")
+            text = "".join(parts)
+        if text.strip():
+            last_text = text  # keep iterating; last match wins
+    return last_text.strip()
+
+
+def cmd_hook_stop(_args: argparse.Namespace) -> int:
+    def _go() -> None:
+        payload = _hook_payload()
+        transcript = payload.get("transcript_path") or payload.get("transcriptPath") or ""
+        if not transcript:
+            return
+        text = _last_assistant_text(transcript)
+        if not text:
+            return
+        tid = _read_active_task()
+        if not tid:
+            # No task pointer means the user is in a non-ERPEX session
+            # (e.g. they never sent a prompt that triggered task creation).
+            return
+        _api_call("POST", "/chat/assistant", {"task_id": tid, "content": text})
+    return _hook_safe(_go)
+
+
+def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
+    def _go() -> None:
+        payload = _hook_payload()
+        tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
+        plan_text = (tool_input.get("plan") or "").strip()
+        if not plan_text:
+            return
+        first_line = next(
+            (ln.strip() for ln in plan_text.splitlines() if ln.strip()),
+            "Plan",
+        )
+        title = _truncate_title(re.sub(r"^#+\s*", "", first_line))
+        tid = _ensure_task(title)
+        _api_call("POST", "/plan/set", {"task_id": tid, "plan_text": plan_text})
+    return _hook_safe(_go)
+
+
+def cmd_hook_post_exit_plan(_args: argparse.Namespace) -> int:
+    def _go() -> None:
+        tid = _read_active_task()
+        if not tid:
+            return
+        _api_call("POST", "/task/stage",
+                  {"task_id": tid, "stage_key": "inprogress"})
+    return _hook_safe(_go)
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="erpex_agentic_client")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("setup")
+    sp.add_argument("--url", required=True)
+    sp.add_argument("--api-key", required=True)
+    sp.add_argument("--model", default="sonnet")
+    sp.set_defaults(fn=cmd_setup)
+
+    sp = sub.add_parser("project-create")
+    sp.add_argument("--name", required=True)
+    sp.set_defaults(fn=cmd_project_create)
+
+    sp = sub.add_parser("task-create")
+    sp.add_argument("--project-id", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--description", default="")
+    sp.add_argument("--agentic-description", default="")
+    sp.add_argument("--parent-id", default="")
+    sp.set_defaults(fn=cmd_task_create)
+
+    sp = sub.add_parser("task-update")
+    sp.add_argument("--task-id", required=True)
+    sp.add_argument("--field", action="append", default=[],
+                    help="KEY=VALUE; pass multiple times. JSON values "
+                         "(starting with [ or {) are decoded.")
+    sp.set_defaults(fn=cmd_task_update)
+
+    sp = sub.add_parser("task-stage")
+    sp.add_argument("--task-id", required=True)
+    sp.add_argument("--stage", required=True,
+                    choices=["draft", "todo", "plan", "inprogress",
+                             "review", "complete"])
+    sp.set_defaults(fn=cmd_task_stage)
+
+    sp = sub.add_parser("chat-user")
+    sp.add_argument("--task-id", required=True)
+    sp.add_argument("--content", required=True)
+    sp.add_argument("--sender", default="")
+    sp.set_defaults(fn=cmd_chat_user)
+
+    sp = sub.add_parser("chat-assistant")
+    sp.add_argument("--task-id", required=True)
+    sp.add_argument("--content", required=True)
+    sp.set_defaults(fn=cmd_chat_assistant)
+
+    sp = sub.add_parser("plan-set")
+    sp.add_argument("--task-id", required=True)
+    grp = sp.add_mutually_exclusive_group(required=True)
+    grp.add_argument("--plan-text")
+    grp.add_argument("--plan-file")
+    sp.set_defaults(fn=cmd_plan_set)
+
+    sp = sub.add_parser("plan-get")
+    sp.add_argument("--task-id", required=True)
+    sp.set_defaults(fn=cmd_plan_get)
+
+    sp = sub.add_parser("hook-user-prompt")
+    sp.set_defaults(fn=cmd_hook_user_prompt)
+
+    sp = sub.add_parser("hook-stop")
+    sp.set_defaults(fn=cmd_hook_stop)
+
+    sp = sub.add_parser("hook-pre-exit-plan")
+    sp.set_defaults(fn=cmd_hook_pre_exit_plan)
+
+    sp = sub.add_parser("hook-post-exit-plan")
+    sp.set_defaults(fn=cmd_hook_post_exit_plan)
+
+    args = p.parse_args(argv)
+    try:
+        return args.fn(args)
+    except HttpError as exc:
+        sys.stderr.write(f"server error: {exc}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

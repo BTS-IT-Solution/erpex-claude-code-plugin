@@ -1,6 +1,6 @@
 ---
 name: erpex-rewriter
-description: Polishes a raw user request into a developer-ready business requirement. Use when /erpex-rewrite is running and you need a clean BR.
+description: Polishes a raw user request into a developer-ready business requirement. Use when /rewrite is running and you need a clean BR.
 model: sonnet
 tools: ["Read", "Glob", "Grep"]
 ---
