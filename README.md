@@ -137,10 +137,28 @@ reads it back via `/plan/get` and starts executing.
 
 ## Troubleshooting
 
+**Run `doctor` first.** It prints your config (key redacted), the last 20
+lines of the hook log, and probes the API for connectivity:
+
+```bash
+python3 "$(claude plugin path erpex-code-agent)/scripts/erpex_agentic_client.py" doctor
+# or, if you know the path:
+python3 ~/.claude/plugins/cache/erpex/erpex-code-agent/*/scripts/erpex_agentic_client.py doctor
+```
+
+Common findings:
+
 - `not configured. Run /setup first.` → Run `/setup`.
-- Hooks succeed but nothing shows in ERPEX → check the URL/API key in
-  `~/.config/erpex-code-agent/plugin.toml`. Hook failures are logged to
-  stderr (one-line `erpex hook: ...`) and never block the Claude turn.
+- `CERTIFICATE_VERIFY_FAILED` in the probe → your ERPEX host has an
+  incomplete TLS chain (e.g. `bts.erpex.ai` omits Sectigo's intermediate
+  cert). Re-run `/setup` with the `insecure` 4th argument:
+  `/setup https://bts.erpex.ai sk_xxx sonnet insecure`. This sets
+  `verify_ssl = "false"` in the config; the client then uses an
+  unverified context for that host.
+- Hooks succeed but nothing shows in ERPEX → check
+  `tail -f ~/.cache/erpex-code-agent/hook.log` to confirm hooks are firing
+  and to see one-line warnings on failures. The hook log is the source of
+  truth — Claude Code's UI does not surface hook stderr.
 - Duplicate projects appearing for the same repo → upgrade ERPEX to a
   build that ships `/project/get-or-create`. Until then, keep
   `.erpex/current_project` checked in or backed up so the cache survives.

@@ -7,7 +7,7 @@ Config lives at `~/.config/erpex-code-agent/plugin.toml` (written by `setup`).
 
 Subcommands:
 
-    setup            --url <u> --api-key <k> [--model <m>]
+    setup            --url <u> --api-key <k> [--model <m>] [--insecure]
     project-create   --name "Foo"
     task-create      --project-id 12 --name "T1" [--description ...]
                                                  [--agentic-description ...]
@@ -32,6 +32,11 @@ Hook subcommands (read JSON payload from stdin, never block the user):
                             (matcher
                             ExitPlanMode)
 
+Diagnostics:
+
+    doctor          prints config (key redacted), tail of hook log, and
+                    runs a connectivity probe against the API. Always 0.
+
 Exit codes:
     0  success (or hook safe-exit on failure)
     1  client error (config / validation / unknown subcommand)
@@ -41,9 +46,11 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import os
 import re
+import ssl
 import stat
 import sys
 import urllib.error
@@ -100,12 +107,14 @@ def _load_config() -> dict:
     return cfg
 
 
-def _save_config(url: str, api_key: str, model: str) -> None:
+def _save_config(url: str, api_key: str, model: str,
+                 verify_ssl: bool = True) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     body = (
         '[odoo]\n'
         f'url = "{url}"\n'
         f'api_key = "{api_key}"\n'
+        f'verify_ssl = "{"true" if verify_ssl else "false"}"\n'
         '\n'
         '[agent]\n'
         f'model = "{model}"\n'
@@ -115,6 +124,15 @@ def _save_config(url: str, api_key: str, model: str) -> None:
         os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass  # Windows / odd FS — best-effort.
+
+
+def _verify_ssl(cfg: dict) -> bool:
+    raw = cfg.get("odoo", {}).get("verify_ssl")
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
 
 
 # ---------------------------------------------------------------- HTTP
@@ -146,8 +164,9 @@ def _request(
         headers["Content-Type"] = "application/json"
         data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    ctx = None if _verify_ssl(cfg) else ssl._create_unverified_context()
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
             raw = resp.read().decode("utf-8") or "{}"
             return json.loads(raw) if raw.strip() else {}
     except urllib.error.HTTPError as exc:
@@ -315,8 +334,9 @@ def _parse_field_kv(items: list[str]) -> dict:
 # ---------------------------------------------------------------- subcommands (regular)
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    _save_config(args.url, args.api_key, args.model or "sonnet")
-    print(f"wrote {CONFIG_PATH}")
+    _save_config(args.url, args.api_key, args.model or "sonnet",
+                 verify_ssl=not args.insecure)
+    print(f"wrote {CONFIG_PATH} (verify_ssl={'false' if args.insecure else 'true'})")
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
     if plugin_root and args.model:
         agents_dir = Path(plugin_root) / "agents"
@@ -417,8 +437,25 @@ def cmd_plan_get(args: argparse.Namespace) -> int:
 
 # ---------------------------------------------------------------- subcommands (hooks)
 
+HOOK_LOG_DIR = Path(os.path.expanduser("~/.cache/erpex-code-agent"))
+HOOK_LOG_PATH = HOOK_LOG_DIR / "hook.log"
+
+
+def _hook_log(line: str) -> None:
+    """Best-effort append to ~/.cache/erpex-code-agent/hook.log. Silent on
+    filesystem errors so logging never breaks the hook itself."""
+    try:
+        HOOK_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with HOOK_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"[{ts}] {line}\n")
+    except OSError:
+        pass
+
+
 def _hook_warn(msg: str) -> None:
     sys.stderr.write(f"erpex hook: {msg}\n")
+    _hook_log(f"WARN {msg}")
 
 
 def _hook_payload() -> dict:
@@ -429,18 +466,21 @@ def _hook_payload() -> dict:
         return {}
 
 
-def _hook_safe(fn) -> int:
+def _hook_safe(name: str, fn) -> int:
     """Wrapper: never raise out of a hook. Always return 0 so Claude isn't
-    blocked by ERPEX flakiness or a missing /setup."""
+    blocked by ERPEX flakiness or a missing /setup. Log entry/exit so the
+    user can `tail -f ~/.cache/erpex-code-agent/hook.log` to diagnose."""
+    _hook_log(f"{name} fired (cwd={os.getcwd()})")
     try:
         fn()
+        _hook_log(f"{name} ok")
     except HttpError as exc:
-        _hook_warn(str(exc))
+        _hook_warn(f"{name}: {exc}")
     except SystemExit:
-        # _load_config calls sys.exit(1) when not configured — silently no-op.
-        pass
+        # _load_config calls sys.exit(1) when not configured — note and skip.
+        _hook_log(f"{name} skipped: not configured (run /setup)")
     except Exception as exc:  # pylint: disable=broad-except
-        _hook_warn(f"unexpected: {exc}")
+        _hook_warn(f"{name}: unexpected: {exc}")
     return 0
 
 
@@ -452,7 +492,7 @@ def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
             return
         tid = _ensure_task(_truncate_title(prompt))
         _api_call("POST", "/chat/user", {"task_id": tid, "content": prompt})
-    return _hook_safe(_go)
+    return _hook_safe("user-prompt", _go)
 
 
 def _last_assistant_text(transcript_path: str) -> str:
@@ -505,7 +545,7 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
             # (e.g. they never sent a prompt that triggered task creation).
             return
         _api_call("POST", "/chat/assistant", {"task_id": tid, "content": text})
-    return _hook_safe(_go)
+    return _hook_safe("stop", _go)
 
 
 def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
@@ -522,7 +562,7 @@ def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
         title = _truncate_title(re.sub(r"^#+\s*", "", first_line))
         tid = _ensure_task(title)
         _api_call("POST", "/plan/set", {"task_id": tid, "plan_text": plan_text})
-    return _hook_safe(_go)
+    return _hook_safe("pre-exit-plan", _go)
 
 
 def cmd_hook_post_exit_plan(_args: argparse.Namespace) -> int:
@@ -532,7 +572,63 @@ def cmd_hook_post_exit_plan(_args: argparse.Namespace) -> int:
             return
         _api_call("POST", "/task/stage",
                   {"task_id": tid, "stage_key": "inprogress"})
-    return _hook_safe(_go)
+    return _hook_safe("post-exit-plan", _go)
+
+
+# ---------------------------------------------------------------- doctor
+
+def _redact_key(key: str) -> str:
+    if not key:
+        return "(empty)"
+    if len(key) <= 8:
+        return "***"
+    return key[:4] + "…" + key[-4:]
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Print config (redacted), tail of hook log, and connectivity probe.
+    Always exits 0 — this is for diagnosis, not for failing CI."""
+    print(f"config: {CONFIG_PATH}")
+    if not CONFIG_PATH.exists():
+        print("  (no config — run /setup)")
+        return 0
+    try:
+        cfg = _parse_toml(CONFIG_PATH.read_text())
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"  parse error: {exc}")
+        return 0
+    odoo = cfg.get("odoo", {})
+    print(f"  url:        {odoo.get('url') or '(missing)'}")
+    print(f"  api_key:    {_redact_key(odoo.get('api_key') or '')}")
+    print(f"  verify_ssl: {_verify_ssl(cfg)}")
+    print(f"  model:      {cfg.get('agent', {}).get('model') or '(unset)'}")
+
+    print(f"\nhook log: {HOOK_LOG_PATH}")
+    if HOOK_LOG_PATH.exists():
+        try:
+            lines = HOOK_LOG_PATH.read_text(errors="replace").splitlines()
+            for line in lines[-20:]:
+                print(f"  {line}")
+        except OSError as exc:
+            print(f"  read error: {exc}")
+    else:
+        print("  (empty — no hook has fired yet)")
+
+    print("\nconnectivity probe: GET /plan/get?task_id=0")
+    try:
+        _api_call("GET", "/plan/get", query={"task_id": 0})
+        print("  ok (server reachable, auth valid)")
+    except HttpError as exc:
+        if exc.status == 404:
+            print("  ok (server reachable, auth valid; no task #0 — expected)")
+        else:
+            print(f"  server replied {exc.status}: {exc.body[:200]}")
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"  failed: {exc}")
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc):
+            print("  → re-run /setup with the `insecure` flag for hosts with "
+                  "an incomplete cert chain.")
+    return 0
 
 
 # ---------------------------------------------------------------- main
@@ -545,6 +641,9 @@ def main(argv: list[str]) -> int:
     sp.add_argument("--url", required=True)
     sp.add_argument("--api-key", required=True)
     sp.add_argument("--model", default="sonnet")
+    sp.add_argument("--insecure", action="store_true",
+                    help="Skip TLS cert verification (set verify_ssl=false). "
+                         "Use for ERPEX hosts with an incomplete cert chain.")
     sp.set_defaults(fn=cmd_setup)
 
     sp = sub.add_parser("project-create")
@@ -606,6 +705,9 @@ def main(argv: list[str]) -> int:
 
     sp = sub.add_parser("hook-post-exit-plan")
     sp.set_defaults(fn=cmd_hook_post_exit_plan)
+
+    sp = sub.add_parser("doctor")
+    sp.set_defaults(fn=cmd_doctor)
 
     args = p.parse_args(argv)
     try:
