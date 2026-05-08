@@ -218,12 +218,33 @@ def _write_pointer(path: Path, key: str, value: int) -> None:
     path.write_text(f"{key}={value}\n")
 
 
-def _read_active_task() -> int | None:
-    return _read_pointer(_active_task_path(), "task_id")
+def _read_active_task() -> tuple[int | None, str | None]:
+    """Return (task_id, session_id). session_id is None for legacy
+    (single-line `task_id=N`) pointer files written before the session-scoped
+    upgrade — those are treated as 'no session' so the next session creates
+    its own fresh task."""
+    path = _active_task_path()
+    if not path.exists():
+        return None, None
+    txt = path.read_text()
+    m = re.search(r"task_id\s*=\s*(\d+)", txt)
+    tid = int(m.group(1)) if m else None
+    if tid is None:
+        s = txt.strip()
+        if s.isdigit():
+            tid = int(s)
+    m = re.search(r"session_id\s*=\s*(\S+)", txt)
+    sid = m.group(1) if m else None
+    return tid, sid
 
 
-def _write_active_task(task_id: int) -> None:
-    _write_pointer(_active_task_path(), "task_id", task_id)
+def _write_active_task(task_id: int, session_id: str = "") -> None:
+    path = _active_task_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = f"task_id={task_id}\n"
+    if session_id:
+        body += f"session_id={session_id}\n"
+    path.write_text(body)
 
 
 def _read_active_project() -> int | None:
@@ -287,16 +308,24 @@ def _ensure_project() -> int:
     return pid
 
 
-def _ensure_task(initial_title: str) -> int:
-    """Return a task_id for the current session, creating one if needed."""
-    tid = _read_active_task()
-    if tid:
-        return tid
+def _ensure_task(initial_title: str, session_id: str = "") -> int:
+    """Return a task_id for the current session, creating one if needed.
+
+    Session-scoped: a new Claude Code session gets a fresh task even when
+    the repo already has a `.erpex/current_task` from an earlier session.
+    Slash commands (no session_id available) trust the cached pointer."""
+    cached_tid, cached_sid = _read_active_task()
+    if cached_tid and cached_sid and session_id and cached_sid == session_id:
+        return cached_tid
+    if cached_tid and not session_id:
+        # Slash-command path: no session context — reuse whatever's cached.
+        return cached_tid
+    # Either no pointer yet OR pointer belongs to a different session.
     pid = _ensure_project()
     body = {"project_id": pid, "name": initial_title or "Untitled task"}
     data = _api_call("POST", "/task/create", body)
     tid = int(data["task_id"])
-    _write_active_task(tid)
+    _write_active_task(tid, session_id)
     return tid
 
 
@@ -490,7 +519,8 @@ def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
         prompt = (payload.get("prompt") or "").strip()
         if not prompt:
             return
-        tid = _ensure_task(_truncate_title(prompt))
+        sid = (payload.get("session_id") or "").strip()
+        tid = _ensure_task(_truncate_title(prompt), sid)
         _api_call("POST", "/chat/user", {"task_id": tid, "content": prompt})
     return _hook_safe("user-prompt", _go)
 
@@ -539,12 +569,17 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
         text = _last_assistant_text(transcript)
         if not text:
             return
-        tid = _read_active_task()
-        if not tid:
-            # No task pointer means the user is in a non-ERPEX session
-            # (e.g. they never sent a prompt that triggered task creation).
+        cached_tid, cached_sid = _read_active_task()
+        if not cached_tid:
+            # No task pointer — user-prompt hook hasn't fired this session.
             return
-        _api_call("POST", "/chat/assistant", {"task_id": tid, "content": text})
+        sid = (payload.get("session_id") or "").strip()
+        if cached_sid and sid and cached_sid != sid:
+            # Cached task belongs to a different session — don't post our
+            # reply onto someone else's task.
+            return
+        _api_call("POST", "/chat/assistant",
+                  {"task_id": cached_tid, "content": text})
     return _hook_safe("stop", _go)
 
 
@@ -560,18 +595,23 @@ def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
             "Plan",
         )
         title = _truncate_title(re.sub(r"^#+\s*", "", first_line))
-        tid = _ensure_task(title)
+        sid = (payload.get("session_id") or "").strip()
+        tid = _ensure_task(title, sid)
         _api_call("POST", "/plan/set", {"task_id": tid, "plan_text": plan_text})
     return _hook_safe("pre-exit-plan", _go)
 
 
 def cmd_hook_post_exit_plan(_args: argparse.Namespace) -> int:
     def _go() -> None:
-        tid = _read_active_task()
-        if not tid:
+        payload = _hook_payload()
+        cached_tid, cached_sid = _read_active_task()
+        if not cached_tid:
+            return
+        sid = (payload.get("session_id") or "").strip()
+        if cached_sid and sid and cached_sid != sid:
             return
         _api_call("POST", "/task/stage",
-                  {"task_id": tid, "stage_key": "inprogress"})
+                  {"task_id": cached_tid, "stage_key": "inprogress"})
     return _hook_safe("post-exit-plan", _go)
 
 
