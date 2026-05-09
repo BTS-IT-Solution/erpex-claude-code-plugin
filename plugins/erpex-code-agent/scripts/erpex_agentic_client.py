@@ -698,26 +698,102 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
     return _hook_safe("stop", _go)
 
 
+_PLAN_MARKER_RE = re.compile(
+    r"\A\s*<!--\s*erpex-plan:\s*(update|new-child)\s*-->\s*\n?",
+    re.IGNORECASE,
+)
+
+
+def _split_plan_marker(plan_text: str) -> tuple[str | None, str]:
+    """Strip a leading `<!-- erpex-plan: update|new-child -->` marker from the
+    plan body and return `(mode, cleaned_text)`. The marker is how Claude (in
+    plan mode, with no Bash/Write available) communicates the user's choice
+    between updating the current plan vs forking a child task.
+
+    If no marker is present, returns `(None, plan_text)`."""
+    m = _PLAN_MARKER_RE.match(plan_text)
+    if not m:
+        return None, plan_text
+    mode = m.group(1).lower()
+    return mode, plan_text[m.end():]
+
+
+def _task_has_plan(task_id: int) -> bool:
+    """Best-effort probe: does this task already have a plan article?
+    Treats every failure mode (HTTP 404, transient server error, malformed
+    body) as 'no existing plan' so a flaky probe never blocks the user."""
+    try:
+        data = _api_call("GET", "/plan/get", query={"task_id": task_id})
+    except (HttpError, urllib.error.URLError, ssl.SSLError, OSError):
+        return False
+    return bool(data.get("body"))
+
+
+_PRE_EXIT_PLAN_DENY_REASON = (
+    "ERPEX: this task already has a plan. Before re-approving, ask the user "
+    "via AskUserQuestion which they want — options must be exactly:\n"
+    "  1. 'Update existing plan' → prepend the line "
+    "`<!-- erpex-plan: update -->` as the very first line of the plan markdown.\n"
+    "  2. 'Create new child task' → prepend the line "
+    "`<!-- erpex-plan: new-child -->` as the very first line of the plan markdown.\n"
+    "Then call ExitPlanMode again with the tagged plan."
+)
+
+
+def _pre_exit_plan_deny(reason: str) -> None:
+    """Print the JSON envelope that tells Claude Code to deny ExitPlanMode
+    and pass `reason` back to Claude as the deny rationale."""
+    sys.stdout.write(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }))
+    sys.stdout.flush()
+
+
 def cmd_hook_pre_exit_plan(_args: argparse.Namespace) -> int:
     def _go() -> None:
         payload = _hook_payload()
         tool_input = payload.get("tool_input") or payload.get("toolInput") or {}
-        plan_text = (tool_input.get("plan") or "").strip()
-        if not plan_text:
+        plan_raw = (tool_input.get("plan") or "").strip()
+        if not plan_raw:
             _hook_log("pre-exit-plan noop reason=empty-plan")
             return
+        mode, plan_text = _split_plan_marker(plan_raw)
+        sid = (payload.get("session_id") or "").strip()
         first_line = next(
             (ln.strip() for ln in plan_text.splitlines() if ln.strip()),
             "Plan",
         )
         title = _truncate_title(re.sub(r"^#+\s*", "", first_line))
-        sid = (payload.get("session_id") or "").strip()
         tid = _ensure_task(title, sid)
+
+        if mode == "new-child":
+            pid = _ensure_project()
+            data = _api_call("POST", "/task/create",
+                             {"project_id": pid, "parent_id": tid, "name": title})
+            new_tid = int(data["task_id"])
+            _write_active_task(new_tid, sid)
+            resp = _api_call("POST", "/plan/set",
+                             {"task_id": new_tid, "plan_text": plan_text})
+            _hook_log(
+                f"pre-exit-plan new-child parent={tid} new={new_tid} "
+                f"len={len(plan_text)} article_id={resp.get('article_id')}"
+            )
+            return
+
+        if mode is None and _task_has_plan(tid):
+            _pre_exit_plan_deny(_PRE_EXIT_PLAN_DENY_REASON)
+            _hook_log(f"pre-exit-plan denied reason=marker-missing task={tid}")
+            return
+
         resp = _api_call("POST", "/plan/set",
                          {"task_id": tid, "plan_text": plan_text})
         _hook_log(
-            f"pre-exit-plan posted task={tid} len={len(plan_text)} "
-            f"article_id={resp.get('article_id')}"
+            f"pre-exit-plan posted task={tid} mode={mode or 'first-plan'} "
+            f"len={len(plan_text)} article_id={resp.get('article_id')}"
         )
     return _hook_safe("pre-exit-plan", _go)
 
