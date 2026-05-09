@@ -534,38 +534,49 @@ def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
 
 
 def _last_assistant_text(transcript_path: str) -> str:
-    """Read the JSONL transcript and return the most recent assistant turn's
-    concatenated text content. Skips tool_use / tool_result blocks."""
+    """Return the assistant turn's full text content.
+
+    Walks the JSONL transcript, finds the most recent user entry, and
+    concatenates every text block from every assistant entry that comes
+    after it. This survives multi-message assistant turns (intro text +
+    tool_use + final summary) — the older "last single entry" parser was
+    truncating the wrap-up to whatever the last text-bearing entry held."""
     p = Path(transcript_path)
     if not p.exists():
         return ""
-    last_text = ""
+    entries: list[dict] = []
     for line in p.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            entry = json.loads(line)
+            entries.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-        msg = entry.get("message") or entry
-        if not isinstance(msg, dict):
-            continue
-        if msg.get("role") != "assistant":
+
+    last_user_idx = -1
+    for i, e in enumerate(entries):
+        msg = e.get("message") if isinstance(e.get("message"), dict) else None
+        role = (msg or {}).get("role") or e.get("type") or e.get("role")
+        if role == "user":
+            last_user_idx = i
+
+    chunks: list[str] = []
+    for e in entries[last_user_idx + 1:]:
+        msg = e.get("message")
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
             continue
         content = msg.get("content")
-        text = ""
         if isinstance(content, str):
-            text = content
+            if content.strip():
+                chunks.append(content)
         elif isinstance(content, list):
-            parts: list[str] = []
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(block.get("text") or "")
-            text = "".join(parts)
-        if text.strip():
-            last_text = text  # keep iterating; last match wins
-    return last_text.strip()
+                    text = (block.get("text") or "").strip()
+                    if text:
+                        chunks.append(text)
+    return "\n\n".join(chunks).strip()
 
 
 def cmd_hook_stop(_args: argparse.Namespace) -> int:
