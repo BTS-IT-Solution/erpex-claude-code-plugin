@@ -47,12 +47,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
 import ssl
 import stat
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -253,6 +255,31 @@ def _read_active_project() -> int | None:
 
 def _write_active_project(project_id: int) -> None:
     _write_pointer(_active_project_path(), "project_id", project_id)
+
+
+def _last_stop_hash_path() -> Path:
+    return _erpex_dir() / "last_stop_hash"
+
+
+def _read_last_stop_hash() -> tuple[int | None, str | None]:
+    """Return (task_id, content_hash) of the most recently posted Stop, or
+    (None, None) if no record. Used to short-circuit duplicate Stop fires
+    that would otherwise post the same assistant text twice."""
+    path = _last_stop_hash_path()
+    if not path.exists():
+        return None, None
+    txt = path.read_text()
+    m_t = re.search(r"task_id\s*=\s*(\d+)", txt)
+    m_h = re.search(r"content_hash\s*=\s*([0-9a-fA-F]+)", txt)
+    tid = int(m_t.group(1)) if m_t else None
+    h = m_h.group(1) if m_h else None
+    return tid, h
+
+
+def _write_last_stop_hash(task_id: int, content_hash: str) -> None:
+    path = _last_stop_hash_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"task_id={task_id}\ncontent_hash={content_hash}\n")
 
 
 def _folder_name() -> str:
@@ -533,14 +560,42 @@ def cmd_hook_user_prompt(_args: argparse.Namespace) -> int:
     return _hook_safe("user-prompt", _go)
 
 
+def _is_real_user_entry(entry: dict) -> bool:
+    """A *real* user entry is a human prompt, not a tool_result wrapper.
+
+    Anthropic's API records tool results as `role=user` entries with
+    content[].type == "tool_result". Those should NOT be the anchor for
+    "everything Claude said since the user spoke last" — the human user
+    is what we mean by user."""
+    msg = entry.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return False
+    content = msg.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        has_tool_result = any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in content
+        )
+        if has_tool_result:
+            return False
+        return any(
+            isinstance(b, dict) and b.get("type") in ("text", "image", "document")
+            for b in content
+        )
+    return False
+
+
 def _last_assistant_text(transcript_path: str) -> str:
     """Return the assistant turn's full text content.
 
-    Walks the JSONL transcript, finds the most recent user entry, and
-    concatenates every text block from every assistant entry that comes
-    after it. This survives multi-message assistant turns (intro text +
-    tool_use + final summary) — the older "last single entry" parser was
-    truncating the wrap-up to whatever the last text-bearing entry held."""
+    Walks the JSONL transcript, finds the most recent *real* user entry
+    (i.e. a human prompt — not a tool_result wrapper), and concatenates
+    every text block from every assistant entry that comes after it.
+    Survives multi-message assistant turns interleaved with tool_use ↔
+    tool_result exchanges, which is the default for any non-trivial
+    Claude turn."""
     p = Path(transcript_path)
     if not p.exists():
         return ""
@@ -556,9 +611,7 @@ def _last_assistant_text(transcript_path: str) -> str:
 
     last_user_idx = -1
     for i, e in enumerate(entries):
-        msg = e.get("message") if isinstance(e.get("message"), dict) else None
-        role = (msg or {}).get("role") or e.get("type") or e.get("role")
-        if role == "user":
+        if _is_real_user_entry(e):
             last_user_idx = i
 
     chunks: list[str] = []
@@ -579,6 +632,26 @@ def _last_assistant_text(transcript_path: str) -> str:
     return "\n\n".join(chunks).strip()
 
 
+def _last_assistant_text_resilient(transcript_path: str,
+                                   retries: int = 4,
+                                   delay_s: float = 0.5) -> str:
+    """Read the transcript with retry-on-empty.
+
+    Stop hooks can fire microseconds before Claude Code finishes flushing
+    the assistant entry to the JSONL. Retrying for a couple of seconds
+    eliminates that flush race in practice. The hook timeout in
+    hooks.json is 15s, so 2-3s of total backoff is well within budget."""
+    text = _last_assistant_text(transcript_path)
+    if text:
+        return text
+    for _ in range(retries):
+        time.sleep(delay_s)
+        text = _last_assistant_text(transcript_path)
+        if text:
+            return text
+    return ""
+
+
 def cmd_hook_stop(_args: argparse.Namespace) -> int:
     def _go() -> None:
         payload = _hook_payload()
@@ -586,7 +659,10 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
         if not transcript:
             _hook_log("stop noop reason=no-transcript-path")
             return
-        text = _last_assistant_text(transcript)
+        # Retry briefly to absorb the JSONL flush race — Claude Code can
+        # fire Stop microseconds before its final assistant entry hits
+        # disk, leaving the parser to see no text.
+        text = _last_assistant_text_resilient(transcript)
         if not text:
             _hook_log(f"stop noop reason=empty-text transcript={transcript}")
             return
@@ -601,8 +677,20 @@ def cmd_hook_stop(_args: argparse.Namespace) -> int:
                 f"cached_sid={cached_sid[:8]}… payload_sid={sid[:8]}…"
             )
             return
+        # Idempotency: skip if we already posted this exact text for this
+        # task. Stop hooks can fire more than once per turn (e.g. when the
+        # transcript writer races us); without this guard we'd double-post.
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        prev_tid, prev_hash = _read_last_stop_hash()
+        if prev_tid == cached_tid and prev_hash == content_hash:
+            _hook_log(
+                f"stop noop reason=duplicate task={cached_tid} "
+                f"hash={content_hash[:8]}…"
+            )
+            return
         resp = _api_call("POST", "/chat/assistant",
                          {"task_id": cached_tid, "content": text})
+        _write_last_stop_hash(cached_tid, content_hash)
         _hook_log(
             f"stop posted task={cached_tid} len={len(text)} "
             f"message_id={resp.get('message_id')}"
