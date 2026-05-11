@@ -14,7 +14,7 @@
         "path": "plugins/erpex-code-agent"
       },
       "description": "Drive ERPEX project.task workflow from Claude Code.",
-      "version": "1.0.0",
+      "version": "1.2.0",
       "homepage": "https://erpex.ai",
       "keywords": ["erpex", "claude-code"]
     }
