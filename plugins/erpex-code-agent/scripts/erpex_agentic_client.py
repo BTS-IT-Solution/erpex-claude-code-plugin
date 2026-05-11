@@ -18,6 +18,7 @@ Subcommands:
     chat-assistant   --task-id 33 --content "..."
     plan-set         --task-id 33 (--plan-text "..." | --plan-file plan.md)
     plan-get         --task-id 33
+    task-get         --task-id 33
 
 Hook subcommands (read JSON payload from stdin, never block the user):
 
@@ -347,6 +348,12 @@ def _ensure_task(initial_title: str, session_id: str = "") -> int:
     if cached_tid and not session_id:
         # Slash-command path: no session context — reuse whatever's cached.
         return cached_tid
+    if cached_tid and session_id and not cached_sid:
+        # Pointer was written by a slash command (e.g. /task, /plan, /implement)
+        # before any user prompt — it has no session binding yet. Adopt the
+        # existing task for THIS session instead of spawning a fresh one.
+        _write_active_task(cached_tid, session_id)
+        return cached_tid
     # Either no pointer yet OR pointer belongs to a different session.
     pid = _ensure_project()
     body = {"project_id": pid, "name": initial_title or "Untitled task"}
@@ -487,6 +494,12 @@ def cmd_plan_set(args: argparse.Namespace) -> int:
 
 def cmd_plan_get(args: argparse.Namespace) -> int:
     data = _api_call("GET", "/plan/get", query={"task_id": int(args.task_id)})
+    _print_json(data)
+    return 0
+
+
+def cmd_task_get(args: argparse.Namespace) -> int:
+    data = _api_call("GET", "/task/get", query={"task_id": int(args.task_id)})
     _print_json(data)
     return 0
 
@@ -939,6 +952,10 @@ def main(argv: list[str]) -> int:
     sp = sub.add_parser("plan-get")
     sp.add_argument("--task-id", required=True)
     sp.set_defaults(fn=cmd_plan_get)
+
+    sp = sub.add_parser("task-get")
+    sp.add_argument("--task-id", required=True)
+    sp.set_defaults(fn=cmd_task_get)
 
     sp = sub.add_parser("hook-user-prompt")
     sp.set_defaults(fn=cmd_hook_user_prompt)

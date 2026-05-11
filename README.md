@@ -6,11 +6,12 @@ Drive ERPEX `project.task` workflow from your own Claude Code session
 
 ## What this gives you
 
-Five slash commands and four hooks that mirror the session into ERPEX:
+Six slash commands and four hooks that mirror the session into ERPEX:
 
 | Command | What it does |
 |---|---|
 | `/setup [url] [api_key] [model]` | Stores ERPEX URL, API key, and rewrite-subagent model. Run once per machine. |
+| `/task <task_id>` | Opens an existing ERPEX task by ID: fetches its description via `/task/get`, prints it into the chat as context, and binds the current session to that task so the rest of the workflow (`/plan`, `/rewrite`, `/implement`, chat mirroring) targets it instead of creating a new one. |
 | `/rewrite [task_id] [project_id]` | Spawns the `erpex-rewriter` subagent and **updates the active task** (auto-created during the session, or supplied) with a polished name + business-requirement description. |
 | `/plan [task_id]` | Generates a plan as Markdown and pushes it to the task's Plan tab via `/plan/set`. |
 | `/implement [task_id]` (alias `/approve`) | Reads the task's plan via `/plan/get` and executes it in the current session. |
@@ -32,7 +33,7 @@ plan-mode) the plan + stage transition in ERPEX, with no manual plumbing.
    Endpoints used: `/project/create`, `/project/get-or-create` (recommended;
    the plugin falls back to `/project/create` if the lookup endpoint is not
    yet deployed), `/task/create`, `/task/update`, `/task/stage`,
-   `/chat/user`, `/chat/assistant`, `/plan/set`, `/plan/get`.
+   `/task/get`, `/chat/user`, `/chat/assistant`, `/plan/set`, `/plan/get`.
 2. **API key.** Generate one in ERPEX: *Preferences → Account Security →
    New API Key* (any name; copy the key).
 3. **Claude Code** with plugin support (`${CLAUDE_PLUGIN_ROOT}` available).
