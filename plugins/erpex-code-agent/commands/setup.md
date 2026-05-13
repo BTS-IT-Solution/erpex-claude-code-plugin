@@ -21,13 +21,18 @@ Build the helper invocation, appending `--insecure` only if `$4` is exactly
 `insecure` (case-insensitive):
 
 ```
+PY="$(command -v python3 || command -v python)"
 INSECURE_FLAG=""
 if [ "$(echo "$4" | tr '[:upper:]' '[:lower:]')" = "insecure" ]; then
   INSECURE_FLAG="--insecure"
 fi
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" setup \
+"$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" setup \
   --url "$1" --api-key "$2" --model "${3:-sonnet}" $INSECURE_FLAG
 ```
+
+(`command -v python3 || command -v python` picks whichever interpreter
+exists — Linux/macOS usually ship `python3`, a default Windows install
+ships only `python`.)
 
 After it succeeds, confirm to the user:
 - Config written to `~/.config/erpex-code-agent/plugin.toml` (mode 0600).
@@ -37,7 +42,7 @@ After it succeeds, confirm to the user:
 
 If hooks misbehave, suggest:
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" doctor
+"$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" doctor
 tail -f ~/.cache/erpex-code-agent/hook.log
 ```
 

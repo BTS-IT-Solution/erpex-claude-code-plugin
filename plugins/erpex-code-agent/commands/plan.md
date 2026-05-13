@@ -34,7 +34,8 @@ Save the plan to `/tmp/erpex-plan-$$.md`.
 ## Step 3 — push to ERPEX
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" plan-set \
+PY="$(command -v python3 || command -v python)"
+"$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" plan-set \
     --task-id "$(grep -oE 'task_id=[0-9]+' .erpex/current_task | cut -d= -f2)" \
     --plan-file /tmp/erpex-plan-$$.md
 ```

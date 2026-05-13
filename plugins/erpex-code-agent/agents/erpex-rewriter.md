@@ -56,7 +56,8 @@ session_id=<uuid>
    the agentic task form replaces the standard description field with
    `agentic_description`, so writing to the standard field is invisible:
    ```bash
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-update \
+   PY="$(command -v python3 || command -v python)"
+   "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-update \
        --task-id "$TID" \
        --field name="$TITLE" \
        --field agentic_description="$BODY"

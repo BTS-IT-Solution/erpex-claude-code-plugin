@@ -20,7 +20,8 @@ task_id".
 ## Step 2 — fetch the plan
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" plan-get \
+PY="$(command -v python3 || command -v python)"
+"$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" plan-get \
     --task-id "$(grep -oE 'task_id=[0-9]+' .erpex/current_task | cut -d= -f2)"
 ```
 
@@ -51,6 +52,7 @@ When done, summarize what changed and tell the user:
 - They should review the diff and move the task to *Review* (or *Complete*)
   in ERPEX when satisfied. To do that from here:
   ```
-  python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-stage \
+  PY="$(command -v python3 || command -v python)"
+  "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-stage \
       --task-id <id> --stage review
   ```

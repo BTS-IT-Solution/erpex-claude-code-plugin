@@ -19,7 +19,8 @@ Order:
 3. Else if `$2` is set, ask the helper to create a new task in that
    project:
    ```
-   python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-create \
+   PY="$(command -v python3 || command -v python)"
+   "$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-create \
        --project-id "$2" --name "Untitled task"
    ```
    The helper writes `.erpex/current_task` automatically.

@@ -30,7 +30,8 @@ The next user prompt's `UserPromptSubmit` hook will adopt this task and add
 ## Step 3 — fetch the task from ERPEX
 
 ```
-python3 "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-get \
+PY="$(command -v python3 || command -v python)"
+"$PY" "${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py" task-get \
     --task-id "$1"
 ```
 

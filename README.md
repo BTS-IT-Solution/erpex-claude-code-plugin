@@ -37,7 +37,9 @@ plan-mode) the plan + stage transition in ERPEX, with no manual plumbing.
 2. **API key.** Generate one in ERPEX: *Preferences → Account Security →
    New API Key* (any name; copy the key).
 3. **Claude Code** with plugin support (`${CLAUDE_PLUGIN_ROOT}` available).
-   Python 3.9+ on PATH (the hooks invoke `python3`).
+   Python 3.9+ on PATH — the hooks try `python3` first and fall back to
+   `python` (a default Windows install of Python only provides `python`,
+   not `python3`).
 
 ## Install
 
@@ -142,6 +144,7 @@ reads it back via `/plan/get` and starts executing.
 lines of the hook log, and probes the API for connectivity:
 
 ```bash
+# Use `python` instead of `python3` on Windows.
 python3 "$(claude plugin path erpex-code-agent)/scripts/erpex_agentic_client.py" doctor
 # or, if you know the path:
 python3 ~/.claude/plugins/cache/erpex/erpex-code-agent/*/scripts/erpex_agentic_client.py doctor
