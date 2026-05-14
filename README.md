@@ -6,7 +6,7 @@ Drive ERPEX `project.task` workflow from your own Claude Code session
 
 ## What this gives you
 
-Six slash commands and four hooks that mirror the session into ERPEX:
+Eight slash commands and four hooks that mirror the session into ERPEX:
 
 | Command | What it does |
 |---|---|
@@ -15,6 +15,8 @@ Six slash commands and four hooks that mirror the session into ERPEX:
 | `/rewrite [task_id] [project_id]` | Spawns the `erpex-rewriter` subagent and **updates the active task** (auto-created during the session, or supplied) with a polished name + business-requirement description. |
 | `/plan [task_id]` | Generates a plan as Markdown and pushes it to the task's Plan tab via `/plan/set`. |
 | `/implement [task_id]` (alias `/approve`) | Reads the task's plan via `/plan/get` and executes it in the current session. |
+| `/article <prompt>` | Generates one ~300–1500 word markdown article from a free-text prompt and creates it as a draft in ERPEX. Asks the user to pick or create a category. Standalone — does not link to any project or task. |
+| `/build-wiki <topic>` | Expands a topic into a Karpathy-inspired interlinked wiki: 1 root category + three fixed subs (`Entities`, `Concepts`, `Synthesis`) + 5–15 cross-linked draft articles + an `<Root> Index` page. Uses Obsidian `[[wikilinks]]` which ERPEX auto-resolves. Two-pass create (titles, then bodies) so all links resolve. |
 
 | Hook | What it does |
 |---|---|
@@ -29,11 +31,14 @@ plan-mode) the plan + stage transition in ERPEX, with no manual plumbing.
 
 ## Prerequisites
 
-1. **ERPEX module enabled.** `erpex_agentic_code` (≥ 19.0.1.0.0) installed.
+1. **ERPEX module enabled.** `erpex_agentic_code` (≥ 19.0.1.1.0 for the
+   `/article` and `/build-wiki` commands; the rest works on ≥ 19.0.1.0.0).
    Endpoints used: `/project/create`, `/project/get-or-create` (recommended;
    the plugin falls back to `/project/create` if the lookup endpoint is not
    yet deployed), `/task/create`, `/task/update`, `/task/stage`,
-   `/task/get`, `/chat/user`, `/chat/assistant`, `/plan/set`, `/plan/get`.
+   `/task/get`, `/chat/user`, `/chat/assistant`, `/plan/set`, `/plan/get`,
+   `/category/create`, `/category/update`, `/category/list`, `/category/get`,
+   `/article/create`, `/article/update`, `/article/get`, `/article/list`.
 2. **API key.** Generate one in ERPEX: *Preferences → Account Security →
    New API Key* (any name; copy the key).
 3. **Claude Code** with plugin support (`${CLAUDE_PLUGIN_ROOT}` available).

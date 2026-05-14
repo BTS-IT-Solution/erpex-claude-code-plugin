@@ -20,6 +20,18 @@ Subcommands:
     plan-get         --task-id 33
     task-get         --task-id 33
 
+    category-create  --name "Foo" [--parent-id 5] [--description ...] [--color ...]
+    category-update  --category-id 5 --field name="Bar" [--field parent_id=7 ...]
+    category-list    [--parent-id 5 | --parent-id all]
+    category-get     --category-id 5
+    article-create   --name "T" --category-id 6 [--body "..." | --body-file p.md]
+                                                [--tag t1 --tag t2]
+                                                [--status draft|waiting_for_approval|published]
+    article-update   --article-id 88 [--field name="..." --field body="..." ...]
+                                     [--tag t1 --tag t2]
+    article-get      --article-id 88
+    article-list     [--category-id 6]
+
 Hook subcommands (read JSON payload from stdin, never block the user):
 
     hook-user-prompt        UserPromptSubmit  → ensure task, POST /chat/user
@@ -504,6 +516,126 @@ def cmd_task_get(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- subcommands (KB: categories)
+
+def cmd_category_create(args: argparse.Namespace) -> int:
+    body: dict = {"name": args.name}
+    if args.parent_id:
+        body["parent_id"] = int(args.parent_id)
+    if args.description:
+        body["description"] = args.description
+    if args.color:
+        body["color"] = args.color
+    data = _api_call("POST", "/category/create", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_category_update(args: argparse.Namespace) -> int:
+    fields = _parse_field_kv(args.field)
+    if not fields:
+        sys.stderr.write("at least one --field KEY=VALUE is required\n")
+        return 1
+    body: dict = {"category_id": int(args.category_id)}
+    body.update(fields)
+    data = _api_call("POST", "/category/update", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_category_list(args: argparse.Namespace) -> int:
+    query: dict = {}
+    raw = (args.parent_id or "").strip()
+    if raw:
+        # Accept either an integer literal or the sentinel "all".
+        if raw.lower() == "all":
+            query["parent_id"] = "all"
+        else:
+            try:
+                query["parent_id"] = int(raw)
+            except ValueError:
+                sys.stderr.write("--parent-id must be an integer or 'all'\n")
+                return 1
+    data = _api_call("GET", "/category/list", query=query or None)
+    _print_json(data)
+    return 0
+
+
+def cmd_category_get(args: argparse.Namespace) -> int:
+    data = _api_call("GET", "/category/get",
+                     query={"category_id": int(args.category_id)})
+    _print_json(data)
+    return 0
+
+
+# ---------------------------------------------------------------- subcommands (KB: articles)
+
+def _resolve_article_body(text: str | None, file: str | None) -> str | None:
+    """Return the body text from either a `--body` literal or a `--body-file`
+    path; None if neither is supplied. The mutual exclusion is enforced by
+    argparse so we only need to handle the single-source-of-truth case here.
+    """
+    if file:
+        return Path(file).read_text()
+    return text
+
+
+def cmd_article_create(args: argparse.Namespace) -> int:
+    body: dict = {
+        "name": args.name,
+        "category_id": int(args.category_id),
+    }
+    article_body = _resolve_article_body(args.body, args.body_file)
+    if article_body is not None:
+        body["body"] = article_body
+    if args.tag:
+        body["tag_names"] = list(args.tag)
+    if args.status:
+        body["status"] = args.status
+    data = _api_call("POST", "/article/create", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_article_update(args: argparse.Namespace) -> int:
+    fields = _parse_field_kv(args.field)
+    # Translate the convenience key body_file → body (read from disk).
+    if "body_file" in fields:
+        fields["body"] = Path(str(fields.pop("body_file"))).read_text()
+    if args.tag:
+        fields["tag_names"] = list(args.tag)
+    if not fields:
+        sys.stderr.write(
+            "at least one --field KEY=VALUE or --tag is required\n"
+        )
+        return 1
+    body: dict = {"article_id": int(args.article_id)}
+    body.update(fields)
+    data = _api_call("POST", "/article/update", body)
+    _print_json(data)
+    return 0
+
+
+def cmd_article_get(args: argparse.Namespace) -> int:
+    data = _api_call("GET", "/article/get",
+                     query={"article_id": int(args.article_id)})
+    _print_json(data)
+    return 0
+
+
+def cmd_article_list(args: argparse.Namespace) -> int:
+    query: dict = {}
+    if args.category_id:
+        try:
+            query["category_id"] = int(args.category_id)
+        except ValueError:
+            sys.stderr.write("--category-id must be an integer\n")
+            return 1
+    data = _api_call("GET", "/article/list", query=query or None)
+    _print_json(data)
+    return 0
+
+
 # ---------------------------------------------------------------- subcommands (hooks)
 
 HOOK_LOG_DIR = Path(os.path.expanduser("~/.cache/erpex-code-agent"))
@@ -956,6 +1088,69 @@ def main(argv: list[str]) -> int:
     sp = sub.add_parser("task-get")
     sp.add_argument("--task-id", required=True)
     sp.set_defaults(fn=cmd_task_get)
+
+    # --- KB: categories ---
+    sp = sub.add_parser("category-create")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--parent-id", default="",
+                    help="Parent category ID. Omit for a root-level category.")
+    sp.add_argument("--description", default="")
+    sp.add_argument("--color", default="")
+    sp.set_defaults(fn=cmd_category_create)
+
+    sp = sub.add_parser("category-update")
+    sp.add_argument("--category-id", required=True)
+    sp.add_argument("--field", action="append", default=[],
+                    help="KEY=VALUE; pass multiple times. Allowed keys: "
+                         "name, parent_id, description, color.")
+    sp.set_defaults(fn=cmd_category_update)
+
+    sp = sub.add_parser("category-list")
+    sp.add_argument("--parent-id", default="",
+                    help="Integer parent ID for direct children, 'all' for "
+                         "the full flat tree, or omit for top-level only.")
+    sp.set_defaults(fn=cmd_category_list)
+
+    sp = sub.add_parser("category-get")
+    sp.add_argument("--category-id", required=True)
+    sp.set_defaults(fn=cmd_category_get)
+
+    # --- KB: articles ---
+    sp = sub.add_parser("article-create")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--category-id", required=True)
+    grp = sp.add_mutually_exclusive_group()
+    grp.add_argument("--body", default=None,
+                     help="Article body as a literal string.")
+    grp.add_argument("--body-file", default=None,
+                     help="Path to a file whose contents become the body.")
+    sp.add_argument("--tag", action="append", default=[],
+                    help="Tag name; pass multiple times. Tags are "
+                         "get-or-created on the server.")
+    sp.add_argument("--status", default=None,
+                    choices=["draft", "waiting_for_approval", "published"],
+                    help="Default is draft (set server-side if omitted).")
+    sp.set_defaults(fn=cmd_article_create)
+
+    sp = sub.add_parser("article-update")
+    sp.add_argument("--article-id", required=True)
+    sp.add_argument("--field", action="append", default=[],
+                    help="KEY=VALUE; pass multiple times. Allowed keys: "
+                         "name, body, body_file (reads file → body), "
+                         "category_id, status.")
+    sp.add_argument("--tag", action="append", default=[],
+                    help="Tag name; pass multiple times. REPLACES the "
+                         "existing tag set.")
+    sp.set_defaults(fn=cmd_article_update)
+
+    sp = sub.add_parser("article-get")
+    sp.add_argument("--article-id", required=True)
+    sp.set_defaults(fn=cmd_article_get)
+
+    sp = sub.add_parser("article-list")
+    sp.add_argument("--category-id", default="",
+                    help="Filter to one category; omit for all articles.")
+    sp.set_defaults(fn=cmd_article_list)
 
     sp = sub.add_parser("hook-user-prompt")
     sp.set_defaults(fn=cmd_hook_user_prompt)
