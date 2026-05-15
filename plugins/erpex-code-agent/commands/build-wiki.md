@@ -24,8 +24,11 @@ If `$ARGUMENTS` is empty, abort with: `Usage: /build-wiki <topic>`.
 ```
 PY="$(command -v python3 || command -v python)"
 CLIENT="${CLAUDE_PLUGIN_ROOT}/scripts/erpex_agentic_client.py"
-TODAY="$(date +%Y-%m-%d)"
 ```
+
+ERPEX auto-tracks `create_date`, `write_date`, `erpex_last_content_update`,
+and `erpex_owner_id` for every article — the slash command never has to
+think about them.
 
 ## Step 2 — pick the wiki root
 
@@ -72,18 +75,27 @@ onward.**
 > - **Synthesis** — opinionated cross-cutting takes: comparisons,
 >   debates, "how X relates to Y", historical arcs.
 >
-> **Article shape.** Every article body starts with this YAML-style
-> header in markdown (rendered into the body because ERPEX has no
-> separate frontmatter field):
-> ```
-> ---
-> tags: [tag1, tag2]
-> sources: [llm-generated]
-> created: <YYYY-MM-DD>
-> updated: <YYYY-MM-DD>
-> ---
-> ```
-> Then the article body in markdown, with H2/H3 sections.
+> **Article shape.** The body is **pure markdown** — no YAML frontmatter,
+> no metadata block. Every metadata field has a structured home in ERPEX
+> and is set via the API, not the body:
+>
+> | Metadata | Where it lives | How you set it |
+> |---|---|---|
+> | Tags | `erpex_tag_ids` | `--tag <name>` flags on `article-create` / `article-update` (one flag per tag) |
+> | Author | `erpex_owner_id` | Auto-set to the API-key user — do nothing |
+> | Created date | `create_date` | Auto-set by Odoo — do nothing |
+> | Updated date | `write_date` + `erpex_last_content_update` | Auto-set on every write — do nothing |
+> | Status | `erpex_status` | `--status draft` (or omit; defaults to `draft`) |
+> | Source provenance | encoded as a tag with the prefix `source:` | `--tag source:llm-generated` on every wiki article |
+>
+> **Do not** write `tags:`, `created:`, `updated:`, `author:`, `status:`,
+> or `sources:` anywhere in the body. ERPEX shows these on the article
+> form already; duplicating them in body text drifts and pollutes the
+> rendered markdown.
+>
+> Body content starts directly with H2 sections (e.g. `## Overview`,
+> `## Why it matters`, `## See also`). Don't even write the title — it's
+> the `name` field, not the body.
 >
 > **Word counts (guidance, not caps).** Entities ~150–400w. Concepts
 > ~200–500w. Synthesis ~300–800w. The Index ~200–500w (mostly a list).
@@ -106,6 +118,9 @@ onward.**
 >      (skew toward Entities + Concepts; 1–3 Synthesis pieces is enough)
 >    - Plus one `<Root> Index` article that lives directly under the
 >      root (one-line links to every other page)
+>    - For each leaf article, also plan **2–4 content tags** (lowercase,
+>      kebab-case-OK) drawn from the topic — these will become real
+>      `erpex_tag_ids` entries via `--tag` flags.
 > 2. **Disambiguate.** Sample existing articles via
 >    `article-list` (no `--category-id`) to detect title collisions. If a
 >    planned title already exists in the DB, append ` (<Root>)` to
@@ -117,31 +132,46 @@ onward.**
 >    if it already exists, per Step 2), then `category-create
 >    --parent-id <root>` for each of `Entities`, `Concepts`, `Synthesis`.
 >    Store `sub_name → sub_id`.
-> 5. **Pass 1 — register every title as a stub.** For each outlined
->    article (Index included), `article-create --name "<Title>"
->    --category-id <target> --body "Stub: pending body" --status draft`.
->    Capture `title → article_id`. Reason: `_sync_wikilinks` resolves
->    `[[Title]]` references by looking up real records at body-write
->    time. Registering all titles first guarantees Pass 2's links resolve
+> 5. **Pass 1 — register every title with real tags as a stub.** For
+>    each outlined article (Index included):
+>    ```
+>    article-create --name "<Title>" --category-id <target> \
+>        --body "Stub: pending body" --status draft \
+>        --tag source:llm-generated --tag wiki:<root-slug> \
+>        --tag <content-tag-1> [--tag <content-tag-2> ...]
+>    ```
+>    where `<root-slug>` is the root category name lowercased with
+>    spaces → hyphens. The `source:` and `wiki:` tags are how we encode
+>    provenance (no body frontmatter needed) — lint can later filter
+>    `name like 'source:%'`. Capture `title → article_id`.
+>
+>    Why register titles first? `_sync_wikilinks` resolves `[[Title]]`
+>    references by looking up real records at body-write time.
+>    Registering all titles first guarantees Pass 2's links resolve
 >    deterministically.
-> 6. **Pass 2 — write real bodies.** For each non-Index article: write
->    the full body (frontmatter + markdown). Embed `[[Title]]`
->    references to OTHER articles in the same wiki wherever they're
->    mentioned. Save to `/tmp/erpex-wiki-<slug>.md`, then
->    `article-update --article-id <id> --field
->    body_file=/tmp/erpex-wiki-<slug>.md`.
-> 7. **Write the Index last.** Body = the YAML header + a list, one line
->    per article, format `- [[Title]] — <≤120 char hook>`, grouped by
->    subcategory.
+> 6. **Pass 2 — write real bodies.** For each non-Index article:
+>    - Write the full body in **pure markdown** — no YAML, no metadata
+>      block, no title line. Start directly with H2 sections.
+>    - Embed `[[Title]]` references to OTHER articles in the same wiki
+>      wherever they're mentioned.
+>    - Save to `/tmp/erpex-wiki-<slug>.md`, then:
+>      ```
+>      article-update --article-id <id> --field body_file=/tmp/erpex-wiki-<slug>.md
+>      ```
+>    - Tags from Pass 1 stay; you don't need to re-pass them.
+> 7. **Write the Index last.** Body = a markdown heading + a list, one
+>    line per article, format `- [[Title]] — <≤120 char hook>`, grouped
+>    by subcategory under H2 headings. No frontmatter.
 > 8. **Lint pass (read-only).** After all writes, `article-get` each
 >    article and surface:
 >    - **Orphans** — articles whose `linked_article_ids` AND
->      `backlink_ids` are both empty (excluding the Index)
+>      `backlink_ids` are both empty (excluding the Index).
 >    - **Dangling links** — `[[Title]]` references in bodies that
 >      didn't resolve (compute by re-reading bodies and checking which
->      `[[…]]` tokens map to known titles in this wiki)
->    - **Ungrounded pages** — every page (since `sources:
->      [llm-generated]`); flag as a follow-up for a future `/ingest`
+>      `[[…]]` tokens map to known titles in this wiki).
+>    - **Ungrounded pages** — articles whose `tags` include
+>      `source:llm-generated` and no other `source:*` tag. Flag as a
+>      follow-up for a future `/ingest`.
 > 9. **Print summary.** Root category ID + name, sub IDs, count of
 >    articles, all `(article_id, title)` pairs, the lint findings, and
 >    the reminder that everything is `draft` — promote to `published` in
@@ -150,8 +180,7 @@ onward.**
 ## Step 4 — execute
 
 Walk the embedded workflow above end-to-end. Use the client commands
-exactly as laid out in Steps 4–8 of the embedded prompt. Use `$TODAY` for
-the `created` and `updated` frontmatter values on first write.
+exactly as laid out in Steps 4–8 of the embedded prompt.
 
 ## Step 5 — final summary
 

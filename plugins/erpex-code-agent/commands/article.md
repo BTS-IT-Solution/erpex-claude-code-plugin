@@ -52,8 +52,12 @@ Write a markdown article tailored to `$ARGUMENTS`. Conventions:
   titles via `_sync_wikilinks()` (case-insensitive); unresolved tokens are
   silently ignored.
 - No HTML — markdown only.
+- **No YAML frontmatter, no metadata block.** Tags / author / created /
+  updated / status all live on real ERPEX fields and are set via the
+  `article-create` flags below — never write them in body text.
 - Infer up to 5 lowercase tag names from the topic (e.g. `python`,
-  `migrations`, `auth`).
+  `migrations`, `auth`). These get passed via `--tag` flags and end up in
+  `erpex_tag_ids` — not in the body.
 
 Write the body (without the H1 line) to a temp file:
 
